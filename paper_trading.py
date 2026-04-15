@@ -1,193 +1,270 @@
+#!/usr/bin/env python3
+"""
+Live Trading Engine: SMA(1000) Momentum Crossover
+
+Adapted from synchronous backtest to asynchronous, event-driven live trading.
+"""
+
 import os
+import sys
 import asyncio
+import logging
 from collections import deque
+from datetime import datetime, time
 from decimal import Decimal
+from typing import Optional
 
-# Assume these are imported from your actual broker/data client modules
-# from paper_broker import PaperBrokerClient
-# from market_data import KafkaMarketDataClient
+from dotenv import load_dotenv
+from paperbroker.client import PaperBrokerClient
+from paperbroker.market_data import RedisMarketDataClient, QuoteSnapshot
 
-# ---------- Strategy constants ----------
-SMA_WINDOW   = 1000
-TP_POINTS    = Decimal('3')
-SL_POINTS    = Decimal('2')
-SYMBOL       = "VN30F1M" # Assuming this is your target symbol
+# Add parent directory to path if needed for your environment
+# sys.path.insert(0, str(Path(__file__).parent.parent))
 
-class SMACrossoverStrategy:
-    def __init__(self, fix_client):
-        self.fix = fix_client
+# Setup logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Strategy Constants ----------
+SMA_WINDOW = 1000
+TP_POINTS = 3.0
+SL_POINTS = 2.0
+END_OF_DAY_CLOSE = time(14, 29, 55)  # 5 seconds before ATC
+
+class LiveSMABot:
+    def __init__(self, symbol: str, account: str):
+        self.symbol = symbol
+        self.account = account
         
-        # Position state
-        self.inventory: int = 0          # +1 = long, -1 = short, 0 = flat
-        self.entry_price = None          # Decimal price at which we entered
+        # --- Strategy State ---
+        self.inventory = 0           # +1 for Long, -1 for Short, 0 for Flat
+        self.entry_price = 0.0
+        self.price_window = deque(maxlen=SMA_WINDOW)
+        self.prev_price: Optional[float] = None
+        self.prev_sma: Optional[float] = None
         
-        # Order state lock to prevent spamming orders while one is in flight
-        self.pending_order = False       
-        self.expected_action = None      # "OPEN_LONG", "OPEN_SHORT", "CLOSE"
+        # --- Execution State ---
+        self.pending_order_id: Optional[str] = None
+        
+        # --- Clients ---
+        self._init_clients()
 
-        # Rolling window
-        self._price_window = deque(maxlen=SMA_WINDOW)
-        self._prev_price = None
-        self._prev_sma = None
+    def _init_clients(self):
+        """Initialize both FIX and Redis clients."""
+        # 1. FIX Client (Execution)
+        self.fix = PaperBrokerClient(
+            default_sub_account=self.account,
+            username=os.getenv("PAPER_USERNAME", "BL01"),
+            password=os.getenv("PAPER_PASSWORD", "123"),
+            rest_base_url=os.getenv("PAPER_REST_BASE_URL", "http://localhost:9090"),
+            socket_connect_host=os.getenv("SOCKET_HOST", "localhost"),
+            socket_connect_port=int(os.getenv("SOCKET_PORT", "5001")),
+            sender_comp_id=os.getenv("SENDER_COMP_ID", "cross-FIX"),
+            target_comp_id=os.getenv("TARGET_COMP_ID", "SERVER"),
+            console=False,
+            order_store_path="live_orders.db" # Crash recovery
+        )
+        
+        # Wire up FIX events
+        self.fix.on("fix:order:filled", self.on_order_filled)
+        self.fix.on("fix:order:canceled", self.on_order_failed)
+        self.fix.on("fix:order:rejected", self.on_order_failed)
 
-    def _current_sma(self):
-        if len(self._price_window) < SMA_WINDOW:
-            return None
-        return sum(self._price_window) / Decimal(SMA_WINDOW)
+        # 2. Redis Client (Market Data)
+        self.md = RedisMarketDataClient(
+            host=os.getenv("MARKET_REDIS_HOST", "localhost"),
+            port=int(os.getenv("MARKET_REDIS_PORT", "6379")),
+            password=os.getenv("MARKET_REDIS_PASSWORD"),
+            merge_updates=True  # Crucial: Give us full snapshot every tick
+        )
 
-    def _unrealised_pnl(self, cur_price: Decimal) -> Decimal:
-        if self.inventory == 0 or self.entry_price is None:
-            return Decimal('0')
-        direction = Decimal('1') if self.inventory > 0 else Decimal('-1')
-        return direction * (cur_price - self.entry_price) # Returns PnL in Index Points
+    # ------------------------------------------------------------------
+    # FIX Event Handlers (Execution Callbacks)
+    # ------------------------------------------------------------------
+    
+    def on_order_filled(self, cl_ord_id, status, last_px, last_qty, **kw):
+        """Handle execution fills."""
+        if cl_ord_id != self.pending_order_id:
+            return # Ignore manual trades or old orders
 
-    def on_quote(self, instrument, quote):
-        if not quote.latest_matched_price:
+        logger.info(f"✅ ORDER FILLED: {last_qty} @ {last_px}")
+        
+        # Determine if this was an entry or an exit
+        if self.inventory == 0:
+            # We were flat, so this is a new entry
+            # (In a production bot, we'd check the order 'side' to be sure)
+            # For simplicity, we infer from previous logic state.
+            pass # Updated strictly right after place_order for now to handle direction
+        else:
+            # We had a position, so this must be a close
+            logger.info("🎯 Position Closed. Flat.")
+            self.inventory = 0
+            self.entry_price = 0.0
+            
+        self.pending_order_id = None # Free the lock
+
+    def on_order_failed(self, cl_ord_id, **kw):
+        """Handle rejected/canceled orders by freeing the lock."""
+        if cl_ord_id == self.pending_order_id:
+            logger.warning("⚠️ Order failed or canceled. Freeing lock.")
+            self.pending_order_id = None
+
+    # ------------------------------------------------------------------
+    # Market Data Callback (Strategy Engine)
+    # ------------------------------------------------------------------
+
+    async def on_quote_update(self, instrument: str, quote: QuoteSnapshot):
+        logger.debug(
+            f"TICK EVAL | Price: {quote.latest_matched_price} | SMA: {cur_sma:.2f} | "
+            f"PrevPx: {self.prev_price} | PrevSMA: {self.prev_sma if self.prev_sma else 0:.2f} | "
+            f"Pos: {self.inventory} | Lock: {self.pending_order_id}"
+        )
+
+        """Tick-by-Tick Evaluation."""
+        tick_price = quote.latest_matched_price
+        if tick_price is None:
             return
 
-        tick_price = Decimal(str(quote.latest_matched_price))
+        # 1. Update rolling window
+        self.price_window.append(tick_price)
+        if len(self.price_window) < SMA_WINDOW:
+            return # Warming up
 
-        # Update rolling SMA window
-        self._price_window.append(tick_price)
-        cur_sma = self._current_sma()
+        cur_sma = sum(self.price_window) / SMA_WINDOW
 
-        # Wait until we have enough ticks to calculate SMA
-        if cur_sma is not None and self._prev_price is not None and self._prev_sma is not None:
-            prev_price = self._prev_price
-            prev_sma   = self._prev_sma
+        # --- DIAGNOSTIC LOGGING ---
+        # Log the exact state on every tick
 
-            # 1. Check Take-Profit / Stop-Loss on an existing position
-            if self.inventory != 0 and not self.pending_order:
-                upnl = self._unrealised_pnl(tick_price)
-                if upnl >= TP_POINTS or upnl <= -SL_POINTS:
-                    print(f"Triggering Exit! Unrealized PnL: {upnl} points")
-                    self._close_position()
+        # Skip evaluation if we are currently waiting for an order to fill
+        if self.pending_order_id is not None:
+            self._update_prev_state(tick_price, cur_sma)
+            return
 
-            # 2. Check for entry signals if we are flat
-            if self.inventory == 0 and not self.pending_order:
-                # Buy signal: prev < SMA and cur >= SMA
-                if prev_price < prev_sma and tick_price >= cur_sma:
-                    print(f"Buy Signal! Price: {tick_price}, SMA: {cur_sma}")
-                    self._open_position(1)
+        # 2. Check End-Of-Day (EOD) Force Close
+        current_time = datetime.now().time()
+        if current_time >= END_OF_DAY_CLOSE:
+            if self.inventory != 0:
+                logger.info("🚨 EOD TRIGGERED. Closing positions.")
+                self.close_position(quote)
+            return # Do not open new positions
+
+        # 3. Check Take-Profit & Stop-Loss
+        if self.inventory != 0:
+            unrealized_pnl = self.inventory * (tick_price - self.entry_price)
+            
+            if unrealized_pnl >= TP_POINTS:
+                logger.info(f"💰 TAKE PROFIT Hit! PnL: +{unrealized_pnl:.1f} pts")
+                self.close_position(quote)
+                self._update_prev_state(tick_price, cur_sma)
+                return
                 
-                # Sell signal: prev > SMA and cur <= SMA
-                elif prev_price > prev_sma and tick_price <= cur_sma:
-                    print(f"Sell Signal! Price: {tick_price}, SMA: {cur_sma}")
-                    self._open_position(-1)
+            if unrealized_pnl <= -SL_POINTS:
+                logger.info(f"🛑 STOP LOSS Hit! PnL: {unrealized_pnl:.1f} pts")
+                self.close_position(quote)
+                self._update_prev_state(tick_price, cur_sma)
+                return
 
-        # Store for next tick
-        self._prev_price = tick_price
-        self._prev_sma   = cur_sma
+        # 4. Check Entry Signals (Crossover)
+        if self.inventory == 0 and self.prev_price is not None and self.prev_sma is not None:
+            # Buy signal: prev < SMA and cur >= SMA
+            if self.prev_price < self.prev_sma and tick_price >= cur_sma:
+                logger.info("📈 BUY Signal (Bullish Crossover)")
+                self.open_position("BUY", quote)
+                
+            # Sell signal: prev > SMA and cur <= SMA
+            elif self.prev_price > self.prev_sma and tick_price <= cur_sma:
+                logger.info("📉 SELL Signal (Bearish Crossover)")
+                self.open_position("SELL", quote)
 
-    def _open_position(self, direction: int):
-        self.pending_order = True
-        self.expected_action = "OPEN_LONG" if direction == 1 else "OPEN_SHORT"
-        side = "BUY" if direction == 1 else "SELL"
+        self._update_prev_state(tick_price, cur_sma)
+
+    def _update_prev_state(self, price, sma):
+        self.prev_price = price
+        self.prev_sma = sma
+
+    # ------------------------------------------------------------------
+    # Execution Helpers
+    # ------------------------------------------------------------------
+
+    def open_position(self, side: str, quote: QuoteSnapshot):
+        """Place an aggressive limit order to open a position."""
+        # Use ceiling for BUY, floor for SELL to ensure instant fill (like a market order)
+        limit_price = quote.ceiling_price if side == "BUY" else quote.floor_price
         
-        # The backtest specifies Limit Buy at ceiling / Limit sell at floor.
-        # If your API supports LIMIT orders, change ord_type to "LIMIT" and pass the calculated price.
-        # For execution guarantees mimicking your snippet, we default to MARKET.
         try:
             order_id = self.fix.place_order(
-                full_symbol=SYMBOL,
+                full_symbol=self.symbol,
                 side=side,
-                qty=1, 
-                ord_type="MARKET"   
+                qty=1,
+                price=limit_price,
+                ord_type="LIMIT"
             )
-            print(f"[{side}] Open Order Placed: {order_id}")
+            self.pending_order_id = order_id
+            self.inventory = 1 if side == "BUY" else -1
+            self.entry_price = quote.latest_matched_price # Track estimated entry
+            logger.info(f"📤 Sent {side} order: {order_id[:8]} at {limit_price}")
         except Exception as e:
-            print(f"Failed to place open order: {e}")
-            self.pending_order = False
+            logger.error(f"Failed to place open order: {e}")
 
-    def _close_position(self):
-        self.pending_order = True
-        self.expected_action = "CLOSE"
-        side = "SELL" if self.inventory > 0 else "BUY"
+    def close_position(self, quote: QuoteSnapshot):
+        """Place an aggressive limit order to close the current position."""
+        side = "SELL" if self.inventory == 1 else "BUY"
+        limit_price = quote.floor_price if side == "SELL" else quote.ceiling_price
         
         try:
             order_id = self.fix.place_order(
-                full_symbol=SYMBOL,
+                full_symbol=self.symbol,
                 side=side,
-                qty=1, 
-                ord_type="MARKET"   
+                qty=1,
+                price=limit_price,
+                ord_type="LIMIT"
             )
-            print(f"[{side}] Close Order Placed: {order_id}")
+            self.pending_order_id = order_id
+            logger.info(f"📤 Sent CLOSE ({side}) order: {order_id[:8]} at {limit_price}")
         except Exception as e:
-            print(f"Failed to place close order: {e}")
-            self.pending_order = False
+            logger.error(f"Failed to place close order: {e}")
 
-    # --- FIX Callbacks ---
-    def on_order_filled(self, cl_ord_id, last_px):
-        """Called when FIX confirms the order is filled."""
-        last_px = Decimal(str(last_px))
-        self.pending_order = False
+    # ------------------------------------------------------------------
+    # Main Loop
+    # ------------------------------------------------------------------
+
+    async def run(self):
+        """Start the live trading engine."""
+        logger.info("🔌 Connecting to FIX Engine...")
+        self.fix.connect()
         
-        if self.expected_action == "OPEN_LONG":
-            self.inventory = 1
-            self.entry_price = last_px
-            print(f"Fill confirmed. Long 1 @ {last_px}")
-            
-        elif self.expected_action == "OPEN_SHORT":
-            self.inventory = -1
-            self.entry_price = last_px
-            print(f"Fill confirmed. Short 1 @ {last_px}")
-            
-        elif self.expected_action == "CLOSE":
-            print(f"Fill confirmed. Position closed @ {last_px}. PnL booked.")
-            self.inventory = 0
-            self.entry_price = None
+        if not self.fix.wait_until_logged_on(timeout=10):
+            logger.error(f"❌ Logon failed: {self.fix.last_logon_error()}")
+            return
 
+        logger.info("✅ FIX Logged On. Checking pending orders...")
+        pending = self.fix.recover_pending_orders()
+        for p in pending:
+            logger.warning(f"🧹 Canceling orphan order: {p['cl_ord_id']}")
+            self.fix.cancel_order(p['cl_ord_id'])
 
-async def main():
-    # 1. Initialize FIX Client
-    fix = PaperBrokerClient(
-        default_sub_account=os.getenv("PAPER_ACCOUNT_ID_D1", "D1"),
-        username=os.getenv("PAPER_USERNAME", "BL01"),
-        password=os.getenv("PAPER_PASSWORD"),
-        rest_base_url=os.getenv("PAPER_REST_BASE_URL", "http://localhost:9090"),
-        socket_connect_host=os.getenv("SOCKET_HOST", "localhost"),
-        socket_connect_port=int(os.getenv("SOCKET_PORT", "5001")),
-        sender_comp_id=os.getenv("SENDER_COMP_ID", "cross-FIX"),
-        target_comp_id=os.getenv("TARGET_COMP_ID", "SERVER"),
-        order_store_path="orders.db",
-        console=False,
-    )
-
-    # 2. Initialize Strategy
-    trader = SMACrossoverStrategy(fix_client=fix)
-
-    # 3. Define FIX Listeners to route to the strategy
-    def on_accepted(cl_ord_id, **kw):
-        print(f"Order {cl_ord_id} accepted by broker.")
-
-    def on_filled(cl_ord_id, last_px, last_qty, **kw):
-        trader.on_order_filled(cl_ord_id, last_px)
-
-    fix.on("fix:order:accepted", on_accepted)
-    fix.on("fix:order:filled", on_filled)
-
-    # Connect to FIX
-    fix.connect()
-    fix.wait_until_logged_on(timeout=10)
-    print("FIX Logged on successfully.")
-
-    # 4. Initialize Kafka Data Feed
-    kafka = KafkaMarketDataClient(
-        bootstrap_servers=os.getenv("PAPERBROKER_KAFKA_BOOTSTRAP_SERVERS"),
-        username=os.getenv("PAPERBROKER_KAFKA_USERNAME"),
-        password=os.getenv("PAPERBROKER_KAFKA_PASSWORD"),
-        env_id=os.getenv("ENV_ID", "DEFAULT"),
-        merge_updates=True
-    )
-
-    # Route Kafka quotes directly to the strategy's tick processor
-    def on_kafka_quote(instrument, quote):
-        trader.on_quote(instrument, quote)
-
-    await kafka.subscribe(SYMBOL, on_kafka_quote)
-    
-    print("Starting Kafka Feed. Listening for ticks...")
-    await kafka.start()
+        logger.info(f"📡 Subscribing to Market Data for {self.symbol}...")
+        await self.md.subscribe(self.symbol, self.on_quote_update)
+        
+        logger.info("🚀 Live Trading Engine Running. Waiting for ticks...")
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("⏹️ Shutting down by user...")
+        finally:
+            await self.md.close()
+            os._exit(0)  # Handle QuickFIX segfault as learned in Example 1
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    load_dotenv()
+    
+    symbol = os.getenv("VN30F1M", "HSX:VNM",)
+    account = os.getenv("PAPER_ACCOUNT_ID_D1", "D1")
+    
+    bot = LiveSMABot(symbol=symbol, account=account)
+    asyncio.run(bot.run())
