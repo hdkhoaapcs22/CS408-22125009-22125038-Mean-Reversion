@@ -263,7 +263,7 @@ class LiveSMABot:
 if __name__ == "__main__":
     load_dotenv()
     
-    symbol = os.getenv("VN30F1M", "HSX:VNM",)
+    symbol = os.getenv("VN30F1M", "HNXDS:VN30F2604",)
     account = os.getenv("PAPER_ACCOUNT_ID_D1", "D1")
     
     bot = LiveSMABot(symbol=symbol, account=account)
