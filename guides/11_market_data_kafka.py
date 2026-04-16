@@ -160,7 +160,7 @@ async def main():
     print(f"Env ID: {env_id}")
     
     # Instrument to subscribe
-    instrument = os.getenv('VN30F1M', 'HNXDS:VN30F2603')
+    instrument = os.getenv('VN30F1M', 'HNXDS:VN30F2604')
     expected_topic = f"{env_id}.{instrument.replace(':', '.')}"
     print(f"Instrument: {instrument}")
     print(f"Topic: {expected_topic}")

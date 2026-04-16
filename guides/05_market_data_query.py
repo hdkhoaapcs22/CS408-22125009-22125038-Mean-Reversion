@@ -44,7 +44,7 @@ async def main():
     
     # Instruments to query
     instruments = [
-        'HNXDS:VN30F2511',
+        'HNXDS:VN30F2604',
         'HSX:VNM',
         'HSX:HPG',
         'HSX:VCB',

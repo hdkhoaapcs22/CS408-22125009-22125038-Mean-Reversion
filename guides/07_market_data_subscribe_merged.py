@@ -34,7 +34,7 @@ load_dotenv()
 REDIS_HOST = os.getenv("MARKET_REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("MARKET_REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("MARKET_REDIS_PASSWORD")
-INSTRUMENT = "HNXDS:VN30F2603"
+INSTRUMENT = "HNXDS:VN30F2604"
 
 
 class UpdateTracker:

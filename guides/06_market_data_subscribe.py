@@ -164,7 +164,7 @@ async def main():
     REDIS_PASSWORD = os.getenv('MARKET_REDIS_PASSWORD')
     
     # Instrument to subscribe
-    INSTRUMENT = 'HNXDS:VN30F2602'
+    INSTRUMENT = 'HSX:VNM'
     
     print("=" * 80)
     print("EXAMPLE 06: MARKET DATA SUBSCRIBE (RAW MODE)")

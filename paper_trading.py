@@ -20,21 +20,21 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from paperbroker.client import PaperBrokerClient
-from paperbroker.market_data import RedisMarketDataClient, QuoteSnapshot
+from paperbroker.market_data import KafkaMarketDataClient, QuoteSnapshot
 
 # Add parent directory to path if needed for your environment
 # sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Setup logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger(__name__)
 
 # ---------- Strategy Constants ----------
-SMA_WINDOW = 1000
+SMA_WINDOW = 10
 TP_POINTS = 3.0
 SL_POINTS = 2.0
 END_OF_DAY_CLOSE = time(14, 29, 55)  # 5 seconds before ATC
@@ -56,6 +56,7 @@ class LiveSMABot:
         
         # --- Execution State ---
         self.pending_order_id: Optional[str] = None
+        self.last_quote_timestamp: Optional[str] = None
         
         # --- Clients ---
         self._init_clients()
@@ -81,12 +82,13 @@ class LiveSMABot:
         self.fix.on("fix:order:canceled", self.on_order_failed)
         self.fix.on("fix:order:rejected", self.on_order_failed)
 
-        # 2. Redis Client (Market Data)
-        self.md = RedisMarketDataClient(
-            host=os.getenv("MARKET_REDIS_HOST", "localhost"),
-            port=int(os.getenv("MARKET_REDIS_PORT", "6379")),
-            password=os.getenv("MARKET_REDIS_PASSWORD"),
-            merge_updates=True  # Crucial: Give us full snapshot every tick
+        
+        self.md = KafkaMarketDataClient(
+            bootstrap_servers=os.getenv('PAPERBROKER_KAFKA_BOOTSTRAP_SERVERS'),
+            username=os.getenv('PAPERBROKER_KAFKA_USERNAME'),
+            password=os.getenv('PAPERBROKER_KAFKA_PASSWORD'),
+            env_id=os.getenv('PAPERBROKER_KAFKA_ENV_ID'),
+            merge_updates=True
         )
 
     # ------------------------------------------------------------------
@@ -123,7 +125,14 @@ class LiveSMABot:
     # Market Data Callback (Strategy Engine)
     # ------------------------------------------------------------------
 
-    async def on_quote_update(self, instrument: str, quote: QuoteSnapshot):
+    def on_quote_update(self, instrument: str, quote: QuoteSnapshot):
+        # --- DIAGNOSTIC LOGGING ---
+        logger.info(
+            f"TICK EVAL | Price: {quote.latest_matched_price} | SMA: {sum(self.price_window) / SMA_WINDOW:.2f} | Window: {len(self.price_window)} | "
+            f"PrevPx: {self.prev_price} | PrevSMA: {self.prev_sma if self.prev_sma else 0:.2f} | "
+            f"Pos: {self.inventory} | Lock: {self.pending_order_id} | Trades: {self.total_trades}"
+        )
+        
         """Tick-by-Tick Evaluation — v2 logic with persistent SMA and immediate re-entry."""
         tick_price = quote.latest_matched_price
         if tick_price is None:
@@ -135,13 +144,6 @@ class LiveSMABot:
             return # Warming up
 
         cur_sma = sum(self.price_window) / SMA_WINDOW
-
-        # --- DIAGNOSTIC LOGGING ---
-        logger.debug(
-            f"TICK EVAL | Price: {tick_price} | SMA: {cur_sma:.2f} | "
-            f"PrevPx: {self.prev_price} | PrevSMA: {self.prev_sma if self.prev_sma else 0:.2f} | "
-            f"Pos: {self.inventory} | Lock: {self.pending_order_id} | Trades: {self.total_trades}"
-        )
 
         # Skip evaluation if we are currently waiting for an order to fill
         if self.pending_order_id is not None:
@@ -256,6 +258,7 @@ class LiveSMABot:
 
         logger.info(f"📡 Subscribing to Market Data for {self.symbol}...")
         await self.md.subscribe(self.symbol, self.on_quote_update)
+        await self.md.start()
         
         logger.info("🚀 Live Trading Engine Running. Waiting for ticks...")
         try:
