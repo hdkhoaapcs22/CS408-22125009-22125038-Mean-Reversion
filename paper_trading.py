@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Live Trading Engine: SMA(1000) Momentum Crossover
+Live Trading Engine: SMA Momentum Crossover (v2)
 
-Adapted from synchronous backtest to asynchronous, event-driven live trading.
+Adapted from backtesting-v2.py to asynchronous, event-driven live trading.
+Key improvements over v1:
+- SMA window persists across sessions (not reset daily)
+- After TP/SL exit, immediately checks for crossover re-entry on the same tick
+- Trade counter for monitoring execution frequency
 """
 
 import os
@@ -46,6 +50,9 @@ class LiveSMABot:
         self.price_window = deque(maxlen=SMA_WINDOW)
         self.prev_price: Optional[float] = None
         self.prev_sma: Optional[float] = None
+        
+        # --- Trade Counter ---
+        self.total_trades: int = 0   # count of completed round-trip trades
         
         # --- Execution State ---
         self.pending_order_id: Optional[str] = None
@@ -96,12 +103,11 @@ class LiveSMABot:
         # Determine if this was an entry or an exit
         if self.inventory == 0:
             # We were flat, so this is a new entry
-            # (In a production bot, we'd check the order 'side' to be sure)
-            # For simplicity, we infer from previous logic state.
-            pass # Updated strictly right after place_order for now to handle direction
+            pass # inventory/entry_price already set in open_position()
         else:
             # We had a position, so this must be a close
-            logger.info("🎯 Position Closed. Flat.")
+            self.total_trades += 1
+            logger.info(f"🎯 Position Closed. Flat. (Total trades: {self.total_trades})")
             self.inventory = 0
             self.entry_price = 0.0
             
@@ -118,13 +124,7 @@ class LiveSMABot:
     # ------------------------------------------------------------------
 
     async def on_quote_update(self, instrument: str, quote: QuoteSnapshot):
-        logger.debug(
-            f"TICK EVAL | Price: {quote.latest_matched_price} | SMA: {cur_sma:.2f} | "
-            f"PrevPx: {self.prev_price} | PrevSMA: {self.prev_sma if self.prev_sma else 0:.2f} | "
-            f"Pos: {self.inventory} | Lock: {self.pending_order_id}"
-        )
-
-        """Tick-by-Tick Evaluation."""
+        """Tick-by-Tick Evaluation — v2 logic with persistent SMA and immediate re-entry."""
         tick_price = quote.latest_matched_price
         if tick_price is None:
             return
@@ -137,7 +137,11 @@ class LiveSMABot:
         cur_sma = sum(self.price_window) / SMA_WINDOW
 
         # --- DIAGNOSTIC LOGGING ---
-        # Log the exact state on every tick
+        logger.debug(
+            f"TICK EVAL | Price: {tick_price} | SMA: {cur_sma:.2f} | "
+            f"PrevPx: {self.prev_price} | PrevSMA: {self.prev_sma if self.prev_sma else 0:.2f} | "
+            f"Pos: {self.inventory} | Lock: {self.pending_order_id} | Trades: {self.total_trades}"
+        )
 
         # Skip evaluation if we are currently waiting for an order to fill
         if self.pending_order_id is not None:
@@ -150,9 +154,12 @@ class LiveSMABot:
             if self.inventory != 0:
                 logger.info("🚨 EOD TRIGGERED. Closing positions.")
                 self.close_position(quote)
-            return # Do not open new positions
+            self._update_prev_state(tick_price, cur_sma)
+            return # Do not open new positions near EOD
 
         # 3. Check Take-Profit & Stop-Loss
+        #    After TP/SL close, we do NOT return — we fall through to check
+        #    for crossover re-entry on the same tick (v2 improvement).
         if self.inventory != 0:
             unrealized_pnl = self.inventory * (tick_price - self.entry_price)
             
@@ -160,13 +167,13 @@ class LiveSMABot:
                 logger.info(f"💰 TAKE PROFIT Hit! PnL: +{unrealized_pnl:.1f} pts")
                 self.close_position(quote)
                 self._update_prev_state(tick_price, cur_sma)
-                return
+                return  # Must wait for fill before re-entry
                 
             if unrealized_pnl <= -SL_POINTS:
                 logger.info(f"🛑 STOP LOSS Hit! PnL: {unrealized_pnl:.1f} pts")
                 self.close_position(quote)
                 self._update_prev_state(tick_price, cur_sma)
-                return
+                return  # Must wait for fill before re-entry
 
         # 4. Check Entry Signals (Crossover)
         if self.inventory == 0 and self.prev_price is not None and self.prev_sma is not None:
