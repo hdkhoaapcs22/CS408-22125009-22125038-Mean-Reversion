@@ -34,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------- Strategy Constants ----------
-SMA_WINDOW = 10
+SMA_WINDOW = 1000
 TP_POINTS = 3.0
 SL_POINTS = 2.0
 END_OF_DAY_CLOSE = time(14, 29, 55)  # 5 seconds before ATC
@@ -74,7 +74,7 @@ class LiveSMABot:
             sender_comp_id=os.getenv("SENDER_COMP_ID", "cross-FIX"),
             target_comp_id=os.getenv("TARGET_COMP_ID", "SERVER"),
             console=False,
-            order_store_path="live_orders.db" # Crash recovery
+            # order_store_path="live_orders.db" # Crash recovery
         )
         
         # Wire up FIX events
@@ -251,10 +251,10 @@ class LiveSMABot:
             return
 
         logger.info("✅ FIX Logged On. Checking pending orders...")
-        pending = self.fix.recover_pending_orders()
-        for p in pending:
-            logger.warning(f"🧹 Canceling orphan order: {p['cl_ord_id']}")
-            self.fix.cancel_order(p['cl_ord_id'])
+        # pending = self.fix.recover_pending_orders()
+        # for p in pending:
+        #     logger.warning(f"🧹 Canceling orphan order: {p['cl_ord_id']}")
+        #     self.fix.cancel_order(p['cl_ord_id'])
 
         logger.info(f"📡 Subscribing to Market Data for {self.symbol}...")
         await self.md.subscribe(self.symbol, self.on_quote_update)
@@ -273,7 +273,7 @@ class LiveSMABot:
 if __name__ == "__main__":
     load_dotenv()
     
-    symbol = os.getenv("VN30F1M", "HNXDS:VN30F2604",)
+    symbol = os.getenv("VN30F1M", "HNXDS:VN30F2605",)
     account = os.getenv("PAPER_ACCOUNT_ID_D1", "D1")
     
     bot = LiveSMABot(symbol=symbol, account=account)
